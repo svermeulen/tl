@@ -18,6 +18,7 @@ local record tl
    enum TargetMode
       "5.1"
       "5.3"
+      "5.4"
    end
 
    record TypeCheckOptions
@@ -1197,6 +1198,17 @@ local enum KeyParsed
    "implicit"
 end
 
+local record Variable
+   t: Type
+   is_const: boolean
+   needs_compat: boolean
+   narrowed_from: Type
+   is_narrowed: boolean
+   declared_at: Node
+   is_func_arg: boolean
+   used: boolean
+end
+
 local record Node
    {Node}
 
@@ -1239,6 +1251,8 @@ local record Node
 
    -- local
    is_const: boolean
+   variable: Variable
+   is_reassigned: boolean
 
    fn_owner: Node
    is_method: boolean
@@ -3850,10 +3864,13 @@ function tl.pretty_print_ast(ast: Node, mode: boolean | PrettyPrintOpts): string
             return out
          end,
       },
-      ["variable"] = {
+      ["identifier"] = {
          after = function(node: Node, _children: {Output}): Output
             local out: Output = { y = node.y, h = 0 }
             add_string(out, node.tk)
+            if node.is_reassigned == false then
+               table.insert(out, " <const>")
+            end
             return out
          end,
       },
@@ -3933,14 +3950,14 @@ function tl.pretty_print_ast(ast: Node, mode: boolean | PrettyPrintOpts): string
 
    visit_node.cbs["expression_list"] = visit_node.cbs["variable_list"]
    visit_node.cbs["argument_list"] = visit_node.cbs["variable_list"]
-   visit_node.cbs["identifier"] = visit_node.cbs["variable"]
-   visit_node.cbs["number"] = visit_node.cbs["variable"]
-   visit_node.cbs["string"] = visit_node.cbs["variable"]
-   visit_node.cbs["nil"] = visit_node.cbs["variable"]
-   visit_node.cbs["boolean"] = visit_node.cbs["variable"]
-   visit_node.cbs["..."] = visit_node.cbs["variable"]
-   visit_node.cbs["argument"] = visit_node.cbs["variable"]
-   visit_node.cbs["type_identifier"] = visit_node.cbs["variable"]
+   visit_node.cbs["number"] = visit_node.cbs["identifier"]
+   visit_node.cbs["string"] = visit_node.cbs["identifier"]
+   visit_node.cbs["nil"] = visit_node.cbs["identifier"]
+   visit_node.cbs["boolean"] = visit_node.cbs["identifier"]
+   visit_node.cbs["..."] = visit_node.cbs["identifier"]
+   visit_node.cbs["argument"] = visit_node.cbs["identifier"]
+   visit_node.cbs["variable"] = visit_node.cbs["identifier"]
+   visit_node.cbs["type_identifier"] = visit_node.cbs["identifier"]
 
    local out = recurse_node(ast, visit_node, visit_type)
    local code: Output
@@ -4389,17 +4406,6 @@ function tl.search_module(module_name: string, search_dtl: boolean): string, FIL
       return found, fd
    end
    return nil, nil, tried
-end
-
-local record Variable
-   t: Type
-   is_const: boolean
-   needs_compat: boolean
-   narrowed_from: Type
-   is_narrowed: boolean
-   declared_at: Node
-   is_func_arg: boolean
-   used: boolean
 end
 
 local function sorted_keys<A,B>(m: {A:B}):{A}
@@ -5060,6 +5066,8 @@ tl.init_env = function(lax: boolean, gen_compat: boolean | CompatMode, gen_targe
    if not gen_target then
       if _VERSION == "Lua 5.1" or _VERSION == "Lua 5.2" then
          gen_target = "5.1"
+      elseif _VERSION == "Lua 5.4" then
+         gen_target = "5.4"
       else
          gen_target = "5.3"
       end
@@ -5137,7 +5145,8 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
       end
    end
 
-   local function find_var_type(name: string, raw: boolean): Type, boolean
+   local function find_var_type(name: string, raw: boolean): Type, boolean, Variable
+      local var: Variable
       if name == "_G" then
          -- this is a static approximation of _G
          local globals: {string:Type} = {}
@@ -5146,15 +5155,20 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
                globals[k] = v.t
             end
          end
-         return a_type {
+         local t = a_type {
             typename = "record",
             field_order = sorted_keys(globals),
             fields = globals,
-         }, false
+         }
+         var = {
+            t = t,
+            is_const = false,
+         }
+      else
+         var = find_var(name, raw)
       end
-      local var = find_var(name, raw)
       if var then
-         return var.t, var.is_const
+         return var.t, var.is_const, var
       end
    end
 
@@ -5947,7 +5961,7 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
          for i = 1, math.min(#t1.types, #t2.types) do
             local ok, err = same_type(t1.types[i], t2.types[i])
             if not ok then
-               add_errs_prefixing(err, all_errs, "values", t1 as Node)
+               add_errs_prefixing(err, all_errs, "tuple index " .. i, t1 as Node)
             end
          end
          return any_errors(all_errs)
@@ -5955,11 +5969,11 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
          local all_errs = {}
          local k_ok, k_errs = same_type(t1.keys, t2.keys)
          if not k_ok then
-            add_errs_prefixing(k_errs, all_errs, "keys", t1 as Node)
+            add_errs_prefixing(k_errs, all_errs, "map keys", t1 as Node)
          end
          local v_ok, v_errs = same_type(t1.values, t2.values)
          if not v_ok then
-            add_errs_prefixing(v_errs, all_errs, "values", t1 as Node)
+            add_errs_prefixing(v_errs, all_errs, "map values", t1 as Node)
          end
          return any_errors(all_errs)
       elseif t1.typename == "union" then
@@ -7719,6 +7733,8 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
          after = function(node: Node, children: {Type}): Type
             local vals: {Type} = get_assignment_values(children[3], #node.vars)
             for i, var in ipairs(node.vars) do
+               var.is_reassigned = false
+
                local decltype = node.decltype and node.decltype[i]
                local infertype = vals and vals[i]
                if lax and infertype and infertype.typename == "nil" then
@@ -7758,6 +7774,8 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
          after = function(node: Node, children: {Type}): Type
             local vals: {Type} = get_assignment_values(children[3], #node.vars)
             for i, var in ipairs(node.vars) do
+               var.is_reassigned = false
+
                local decltype = node.decltype and node.decltype[i]
                local infertype = vals and vals[i]
                if lax and infertype and infertype.typename == "nil" then
@@ -7809,8 +7827,11 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
                local is_const = varnode.is_const
                if varnode.kind == "variable" then
                   if widen_back_var(varnode.tk) then
-                     vartype, is_const = find_var_type(varnode.tk)
+                     vartype, is_const, varnode.variable = find_var_type(varnode.tk)
                   end
+               end
+               if varnode.variable and varnode.variable.declared_at then
+                  varnode.variable.declared_at.is_reassigned = true
                end
                if is_const then
                   node_error(varnode, "cannot assign to <const> variable")
@@ -8066,6 +8087,22 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
          end,
       },
       ["variable_list"] = {
+         after = function(node: Node, children: {Type}): Type
+            node.type = TUPLE(children)
+            return node.type
+         end,
+      },
+      ["argument_list"] = {
+         after = function(node: Node, children: {Type}): Type
+            node.type = TUPLE(children)
+            local n = #node
+            if n > 0 and node[n].tk == "..." then
+               node.type.is_va = true
+            end
+            return node.type
+         end,
+      },
+      ["expression_list"] = {
          after = function(node: Node, children: {Type}): Type
             node.type = TUPLE(children)
 
@@ -8581,7 +8618,7 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
                end
             end
 
-            node.type, node.is_const = find_var_type(node.tk)
+            node.type, node.is_const, node.variable = find_var_type(node.tk)
             if node.type and is_typetype(node.type) then
                node.type = a_type {
                   y = node.y,
@@ -8654,9 +8691,6 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): {Error}, {Error}, T
    }
 
    visit_node.cbs["break"] = visit_node.cbs["do"]
-
-   visit_node.cbs["expression_list"] = visit_node.cbs["variable_list"]
-   visit_node.cbs["argument_list"] = visit_node.cbs["variable_list"]
 
    visit_node.cbs["string"] = {
       after = function(node: Node, _children: {Type}): Type
