@@ -7553,7 +7553,7 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): Result, string
    local function match_record_key(tbl: Type, rec: Node, key: string): Type, string
       assert(type(tbl) == "table")
       assert(type(rec) == "table")
-      assert(type(key) == "string")
+      assert(type(key) == "string", "Unexpected type '" .. tostring(type(key)) .. "'")
 
       tbl = resolve_tuple_and_nominal(tbl)
 
@@ -9807,12 +9807,18 @@ tl.type_check = function(ast: Node, opts: TypeCheckOptions): Result, string
                   end
                   node.type = UNKNOWN
                else
-                  local t, e = match_record_key(a, node.e1, node.e2.conststr or node.e2.tk)
-                  if not t then
+                  local k = node.e2.conststr or node.e2.tk
+                  if not k then
                      node.type = INVALID
-                     return node_error(node.e2, e, a == INVALID and a or resolve_tuple(orig_a))
+                     return node_error(node, "unknown error")
+                  else
+                     local t, e = match_record_key(a, node.e1, k)
+                     if not t then
+                        node.type = INVALID
+                        return node_error(node.e2, e, a == INVALID and a or resolve_tuple(orig_a))
+                     end
+                     node.type = t
                   end
-                  node.type = t
                end
             elseif node.op.op == "not" then
                node.known = facts_not(node, node.e1.known)
